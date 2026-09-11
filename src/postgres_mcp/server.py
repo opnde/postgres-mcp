@@ -108,7 +108,17 @@ async def sql_session(ctx: Context | None) -> AsyncIterator[Union[SqlDriver, Saf
     headers = _request_headers(ctx)
     conninfo = conninfo_for(headers, identity_config)
     role = role_of(headers, identity_config)
-    conn = await psycopg.AsyncConnection.connect(conninfo)
+    try:
+        conn = await psycopg.AsyncConnection.connect(conninfo)
+    except psycopg.OperationalError as exc:
+        # psycopg names host and port in its message ("connection to server at
+        # 10.x.x.x, port 5434 failed: FATAL: password authentication failed for
+        # user ..."). That message would travel to the MCP client and, from
+        # there, into a chat transcript - handing out internal topology and
+        # confirming which role names exist. Keep the detail in the server log,
+        # return a flat refusal.
+        logger.warning("login failed for role %s: %s", role, obfuscate_password(str(exc)))
+        raise AuthError("database login failed") from exc
     try:
         # Logged per call because this is the only record tying an MCP request to
         # a database login; the password never reaches the log.
