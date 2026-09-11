@@ -5,13 +5,17 @@ import logging
 import os
 import signal
 import sys
+from contextlib import asynccontextmanager
 from enum import Enum
 from typing import Any
+from typing import AsyncIterator
 from typing import List
 from typing import Literal
 from typing import Union
 
 import mcp.types as types
+import psycopg
+from mcp.server.fastmcp import Context
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import Field
@@ -24,6 +28,10 @@ from .artifacts import ExplainPlanArtifact
 from .database_health import DatabaseHealthTool
 from .database_health import HealthType
 from .explain import ExplainPlanTool
+from .identity import AuthError
+from .identity import IdentityConfig
+from .identity import conninfo_for
+from .identity import role_of
 from .index.index_opt_base import MAX_NUM_INDEX_TUNING_QUERIES
 from .index.llm_opt import LLMOptimizerTool
 from .index.presentation import TextPresentation
@@ -57,18 +65,71 @@ class AccessMode(str, Enum):
 db_connection = DbConnPool()
 current_access_mode = AccessMode.UNRESTRICTED
 shutdown_in_progress = False
+# In `dsn` mode (upstream behaviour) this stays disabled and nothing below changes.
+identity_config = IdentityConfig()
 
 
-async def get_sql_driver() -> Union[SqlDriver, SafeSqlDriver]:
-    """Get the appropriate SQL driver based on the current access mode."""
-    base_driver = SqlDriver(conn=db_connection)
-
+def _wrap_driver(base_driver: SqlDriver) -> Union[SqlDriver, SafeSqlDriver]:
+    """Apply the access mode. The restricted wrapper is what makes this safe."""
     if current_access_mode == AccessMode.RESTRICTED:
         logger.debug("Using SafeSqlDriver with restrictions (RESTRICTED mode)")
         return SafeSqlDriver(sql_driver=base_driver, timeout=30)  # 30 second timeout
-    else:
-        logger.debug("Using unrestricted SqlDriver (UNRESTRICTED mode)")
-        return base_driver
+    logger.debug("Using unrestricted SqlDriver (UNRESTRICTED mode)")
+    return base_driver
+
+
+async def get_sql_driver() -> Union[SqlDriver, SafeSqlDriver]:
+    """Driver over the shared, process-wide pool (`dsn` mode).
+
+    In `header` mode there is no shared pool on purpose, so this fails instead of
+    silently serving someone else's connection. Tools that support per-request
+    credentials use `sql_session()` below; the remaining tools are unavailable in
+    that mode, which is the honest outcome - a tool that cannot say who is asking
+    has no business on a shared endpoint.
+    """
+    if identity_config.enabled:
+        raise AuthError("this tool is unavailable when per-request credentials are enabled")
+    return _wrap_driver(SqlDriver(conn=db_connection))
+
+
+@asynccontextmanager
+async def sql_session(ctx: Context | None) -> AsyncIterator[Union[SqlDriver, SafeSqlDriver]]:
+    """Yield a driver for one tool call, then close whatever it opened.
+
+    `dsn` mode hands out the shared pool, exactly as upstream does. `header` mode
+    opens a fresh connection as the person behind the request and closes it in
+    `finally` - no pool keyed by user name, because a warm connection must never
+    be reachable by a later request that failed to prove the same identity.
+    """
+    if not identity_config.enabled:
+        yield _wrap_driver(SqlDriver(conn=db_connection))
+        return
+
+    headers = _request_headers(ctx)
+    conninfo = conninfo_for(headers, identity_config)
+    role = role_of(headers, identity_config)
+    conn = await psycopg.AsyncConnection.connect(conninfo)
+    try:
+        # Logged per call because this is the only record tying an MCP request to
+        # a database login; the password never reaches the log.
+        logger.info("sql session opened for role %s", role)
+        yield _wrap_driver(SqlDriver(conn=conn))
+    finally:
+        await conn.close()
+
+
+def _request_headers(ctx: Context | None) -> dict[str, str]:
+    """Lower-cased headers of the HTTP request behind this tool call.
+
+    Only HTTP transports carry a request. Under stdio there is none, and there is
+    nothing sensible to fall back to, so per-request credentials and stdio are
+    mutually exclusive by construction.
+    """
+    request = getattr(getattr(ctx, "request_context", None), "request", None)
+    headers = getattr(request, "headers", None)
+    if headers is None:
+        raise AuthError("per-request credentials require an HTTP transport (sse or streamable-http)")
+    return {k.lower(): v for k, v in headers.items()}
 
 
 def format_text_response(text: Any) -> ResponseType:
@@ -121,67 +182,75 @@ async def list_schemas() -> ResponseType:
     ),
 )
 async def list_objects(
+    ctx: Context,
     schema_name: str = Field(description="Schema name"),
     object_type: str = Field(description="Object type: 'table', 'view', 'sequence', or 'extension'", default="table"),
 ) -> ResponseType:
     """List objects of a given type in a schema."""
     try:
-        sql_driver = await get_sql_driver()
+        async with sql_session(ctx) as sql_driver:
 
-        if object_type in ("table", "view"):
-            table_type = "BASE TABLE" if object_type == "table" else "VIEW"
-            rows = await SafeSqlDriver.execute_param_query(
-                sql_driver,
-                """
-                SELECT table_schema, table_name, table_type
-                FROM information_schema.tables
-                WHERE table_schema = {} AND table_type = {}
-                ORDER BY table_name
-                """,
-                [schema_name, table_type],
-            )
-            objects = (
-                [{"schema": row.cells["table_schema"], "name": row.cells["table_name"], "type": row.cells["table_type"]} for row in rows]
-                if rows
-                else []
-            )
+            if object_type in ("table", "view"):
+                table_type = "BASE TABLE" if object_type == "table" else "VIEW"
+                rows = await SafeSqlDriver.execute_param_query(
+                    sql_driver,
+                    """
+                    SELECT table_schema, table_name, table_type
+                    FROM information_schema.tables
+                    WHERE table_schema = {} AND table_type = {}
+                    ORDER BY table_name
+                    """,
+                    [schema_name, table_type],
+                )
+                objects = (
+                    [{"schema": row.cells["table_schema"], "name": row.cells["table_name"], "type": row.cells["table_type"]} for row in rows]
+                    if rows
+                    else []
+                )
 
-        elif object_type == "sequence":
-            rows = await SafeSqlDriver.execute_param_query(
-                sql_driver,
-                """
-                SELECT sequence_schema, sequence_name, data_type
-                FROM information_schema.sequences
-                WHERE sequence_schema = {}
-                ORDER BY sequence_name
-                """,
-                [schema_name],
-            )
-            objects = (
-                [{"schema": row.cells["sequence_schema"], "name": row.cells["sequence_name"], "data_type": row.cells["data_type"]} for row in rows]
-                if rows
-                else []
-            )
+            elif object_type == "sequence":
+                rows = await SafeSqlDriver.execute_param_query(
+                    sql_driver,
+                    """
+                    SELECT sequence_schema, sequence_name, data_type
+                    FROM information_schema.sequences
+                    WHERE sequence_schema = {}
+                    ORDER BY sequence_name
+                    """,
+                    [schema_name],
+                )
+                objects = (
+                    [
+                        {
+                            "schema": row.cells["sequence_schema"],
+                            "name": row.cells["sequence_name"],
+                            "data_type": row.cells["data_type"],
+                        }
+                        for row in rows
+                    ]
+                    if rows
+                    else []
+                )
 
-        elif object_type == "extension":
-            # Extensions are not schema-specific
-            rows = await sql_driver.execute_query(
-                """
-                SELECT extname, extversion, extrelocatable
-                FROM pg_extension
-                ORDER BY extname
-                """
-            )
-            objects = (
-                [{"name": row.cells["extname"], "version": row.cells["extversion"], "relocatable": row.cells["extrelocatable"]} for row in rows]
-                if rows
-                else []
-            )
+            elif object_type == "extension":
+                # Extensions are not schema-specific
+                rows = await sql_driver.execute_query(
+                    """
+                    SELECT extname, extversion, extrelocatable
+                    FROM pg_extension
+                    ORDER BY extname
+                    """
+                )
+                objects = (
+                    [{"name": row.cells["extname"], "version": row.cells["extversion"], "relocatable": row.cells["extrelocatable"]} for row in rows]
+                    if rows
+                    else []
+                )
 
-        else:
-            return format_error_response(f"Unsupported object type: {object_type}")
+            else:
+                return format_error_response(f"Unsupported object type: {object_type}")
 
-        return format_text_response(objects)
+            return format_text_response(objects)
     except Exception as e:
         logger.error(f"Error listing objects: {e}")
         return format_error_response(str(e))
@@ -195,132 +264,133 @@ async def list_objects(
     ),
 )
 async def get_object_details(
+    ctx: Context,
     schema_name: str = Field(description="Schema name"),
     object_name: str = Field(description="Object name"),
     object_type: str = Field(description="Object type: 'table', 'view', 'sequence', or 'extension'", default="table"),
 ) -> ResponseType:
     """Get detailed information about a database object."""
     try:
-        sql_driver = await get_sql_driver()
+        async with sql_session(ctx) as sql_driver:
 
-        if object_type in ("table", "view"):
-            # Get columns
-            col_rows = await SafeSqlDriver.execute_param_query(
-                sql_driver,
-                """
-                SELECT column_name, data_type, is_nullable, column_default
-                FROM information_schema.columns
-                WHERE table_schema = {} AND table_name = {}
-                ORDER BY ordinal_position
-                """,
-                [schema_name, object_name],
-            )
-            columns = (
-                [
-                    {
-                        "column": r.cells["column_name"],
-                        "data_type": r.cells["data_type"],
-                        "is_nullable": r.cells["is_nullable"],
-                        "default": r.cells["column_default"],
-                    }
-                    for r in col_rows
-                ]
-                if col_rows
-                else []
-            )
+            if object_type in ("table", "view"):
+                # Get columns
+                col_rows = await SafeSqlDriver.execute_param_query(
+                    sql_driver,
+                    """
+                    SELECT column_name, data_type, is_nullable, column_default
+                    FROM information_schema.columns
+                    WHERE table_schema = {} AND table_name = {}
+                    ORDER BY ordinal_position
+                    """,
+                    [schema_name, object_name],
+                )
+                columns = (
+                    [
+                        {
+                            "column": r.cells["column_name"],
+                            "data_type": r.cells["data_type"],
+                            "is_nullable": r.cells["is_nullable"],
+                            "default": r.cells["column_default"],
+                        }
+                        for r in col_rows
+                    ]
+                    if col_rows
+                    else []
+                )
 
-            # Get constraints
-            con_rows = await SafeSqlDriver.execute_param_query(
-                sql_driver,
-                """
-                SELECT tc.constraint_name, tc.constraint_type, kcu.column_name
-                FROM information_schema.table_constraints AS tc
-                LEFT JOIN information_schema.key_column_usage AS kcu
-                  ON tc.constraint_name = kcu.constraint_name
-                 AND tc.table_schema = kcu.table_schema
-                WHERE tc.table_schema = {} AND tc.table_name = {}
-                """,
-                [schema_name, object_name],
-            )
+                # Get constraints
+                con_rows = await SafeSqlDriver.execute_param_query(
+                    sql_driver,
+                    """
+                    SELECT tc.constraint_name, tc.constraint_type, kcu.column_name
+                    FROM information_schema.table_constraints AS tc
+                    LEFT JOIN information_schema.key_column_usage AS kcu
+                      ON tc.constraint_name = kcu.constraint_name
+                     AND tc.table_schema = kcu.table_schema
+                    WHERE tc.table_schema = {} AND tc.table_name = {}
+                    """,
+                    [schema_name, object_name],
+                )
 
-            constraints = {}
-            if con_rows:
-                for row in con_rows:
-                    cname = row.cells["constraint_name"]
-                    ctype = row.cells["constraint_type"]
-                    col = row.cells["column_name"]
+                constraints = {}
+                if con_rows:
+                    for row in con_rows:
+                        cname = row.cells["constraint_name"]
+                        ctype = row.cells["constraint_type"]
+                        col = row.cells["column_name"]
 
-                    if cname not in constraints:
-                        constraints[cname] = {"type": ctype, "columns": []}
-                    if col:
-                        constraints[cname]["columns"].append(col)
+                        if cname not in constraints:
+                            constraints[cname] = {"type": ctype, "columns": []}
+                        if col:
+                            constraints[cname]["columns"].append(col)
 
-            constraints_list = [{"name": name, **data} for name, data in constraints.items()]
+                constraints_list = [{"name": name, **data} for name, data in constraints.items()]
 
-            # Get indexes
-            idx_rows = await SafeSqlDriver.execute_param_query(
-                sql_driver,
-                """
-                SELECT indexname, indexdef
-                FROM pg_indexes
-                WHERE schemaname = {} AND tablename = {}
-                """,
-                [schema_name, object_name],
-            )
+                # Get indexes
+                idx_rows = await SafeSqlDriver.execute_param_query(
+                    sql_driver,
+                    """
+                    SELECT indexname, indexdef
+                    FROM pg_indexes
+                    WHERE schemaname = {} AND tablename = {}
+                    """,
+                    [schema_name, object_name],
+                )
 
-            indexes = [{"name": r.cells["indexname"], "definition": r.cells["indexdef"]} for r in idx_rows] if idx_rows else []
+                indexes = [{"name": r.cells["indexname"], "definition": r.cells["indexdef"]} for r in idx_rows] if idx_rows else []
 
-            result = {
-                "basic": {"schema": schema_name, "name": object_name, "type": object_type},
-                "columns": columns,
-                "constraints": constraints_list,
-                "indexes": indexes,
-            }
-
-        elif object_type == "sequence":
-            rows = await SafeSqlDriver.execute_param_query(
-                sql_driver,
-                """
-                SELECT sequence_schema, sequence_name, data_type, start_value, increment
-                FROM information_schema.sequences
-                WHERE sequence_schema = {} AND sequence_name = {}
-                """,
-                [schema_name, object_name],
-            )
-
-            if rows and rows[0]:
-                row = rows[0]
                 result = {
-                    "schema": row.cells["sequence_schema"],
-                    "name": row.cells["sequence_name"],
-                    "data_type": row.cells["data_type"],
-                    "start_value": row.cells["start_value"],
-                    "increment": row.cells["increment"],
+                    "basic": {"schema": schema_name, "name": object_name, "type": object_type},
+                    "columns": columns,
+                    "constraints": constraints_list,
+                    "indexes": indexes,
                 }
+
+            elif object_type == "sequence":
+                rows = await SafeSqlDriver.execute_param_query(
+                    sql_driver,
+                    """
+                    SELECT sequence_schema, sequence_name, data_type, start_value, increment
+                    FROM information_schema.sequences
+                    WHERE sequence_schema = {} AND sequence_name = {}
+                    """,
+                    [schema_name, object_name],
+                )
+
+                if rows and rows[0]:
+                    row = rows[0]
+                    result = {
+                        "schema": row.cells["sequence_schema"],
+                        "name": row.cells["sequence_name"],
+                        "data_type": row.cells["data_type"],
+                        "start_value": row.cells["start_value"],
+                        "increment": row.cells["increment"],
+                    }
+                else:
+                    result = {}
+
+            elif object_type == "extension":
+                rows = await SafeSqlDriver.execute_param_query(
+                    sql_driver,
+                    """
+                    SELECT extname, extversion, extrelocatable
+                    FROM pg_extension
+                    WHERE extname = {}
+                    """,
+                    [object_name],
+                )
+
+                if rows and rows[0]:
+                    row = rows[0]
+                    result = {"name": row.cells["extname"], "version": row.cells["extversion"], "relocatable": row.cells["extrelocatable"]}
+                else:
+                    result = {}
+
             else:
-                result = {}
+                return format_error_response(f"Unsupported object type: {object_type}")
 
-        elif object_type == "extension":
-            rows = await SafeSqlDriver.execute_param_query(
-                sql_driver,
-                """
-                SELECT extname, extversion, extrelocatable
-                FROM pg_extension
-                WHERE extname = {}
-                """,
-                [object_name],
-            )
-
-            if rows and rows[0]:
-                row = rows[0]
-                result = {"name": row.cells["extname"], "version": row.cells["extversion"], "relocatable": row.cells["extrelocatable"]}
-            else:
-                result = {}
-
-        else:
-            return format_error_response(f"Unsupported object type: {object_type}")
-
-        return format_text_response(result)
+            return format_text_response(result)
     except Exception as e:
         logger.error(f"Error getting object details: {e}")
         return format_error_response(str(e))
@@ -413,15 +483,16 @@ If there is no hypothetical index, you can pass an empty list.""",
 
 # Query function declaration without the decorator - we'll add it dynamically based on access mode
 async def execute_sql(
+    ctx: Context,
     sql: str = Field(description="SQL to run", default="all"),
 ) -> ResponseType:
     """Executes a SQL query against the database."""
     try:
-        sql_driver = await get_sql_driver()
-        rows = await sql_driver.execute_query(sql)  # type: ignore
-        if rows is None:
-            return format_text_response("No results")
-        return format_text_response(list([r.cells for r in rows]))
+        async with sql_session(ctx) as sql_driver:
+            rows = await sql_driver.execute_query(sql)  # type: ignore
+            if rows is None:
+                return format_text_response("No results")
+            return format_text_response(list([r.cells for r in rows]))
     except Exception as e:
         logger.error(f"Error executing query: {e}")
         return format_error_response(str(e))
@@ -625,25 +696,57 @@ async def main():
 
     logger.info(f"Starting PostgreSQL MCP Server in {current_access_mode.upper()} mode")
 
-    # Get database URL from environment variable or command line
-    database_url = os.environ.get("DATABASE_URI", args.database_url)
+    # Authentication mode. `dsn` is upstream behaviour: one connection URL for the
+    # whole process. `header` takes role and password from each request instead,
+    # so the database sees the actual person (see identity.py).
+    global identity_config
+    identity_config = IdentityConfig.from_env()
 
-    if not database_url:
-        raise ValueError(
-            "Error: No database URL provided. Please specify via 'DATABASE_URI' environment variable or command-line argument.",
+    if identity_config.enabled:
+        if args.transport == "stdio":
+            raise ValueError(
+                "PGMCP_AUTH_MODE=header needs an HTTP transport (--transport sse or streamable-http); "
+                "stdio has no request to take credentials from.",
+            )
+        if os.environ.get("DATABASE_URI") or args.database_url:
+            # A leftover DSN here would be a loaded gun: one misrouted code path and
+            # every request runs as that role again, silently and with full rights.
+            raise ValueError(
+                "PGMCP_AUTH_MODE=header must not be combined with DATABASE_URI or a positional "
+                "database URL - remove it so no shared connection can exist.",
+            )
+        logger.info(
+            "Per-request credentials enabled: header %s, database %s/%s, JWT verification %s",
+            identity_config.credential_header,
+            identity_config.host,
+            identity_config.dbname,
+            "on" if identity_config.jwt_required else "OFF",
         )
+        if not identity_config.jwt_required:
+            logger.warning(
+                "No edge assertion required. Anything that can reach this port may attempt a login; "
+                "put an authenticating proxy in front or set PGMCP_JWT_ISSUER.",
+            )
+    else:
+        # Get database URL from environment variable or command line
+        database_url = os.environ.get("DATABASE_URI", args.database_url)
 
-    # Initialize database connection pool
-    try:
-        await db_connection.pool_connect(database_url)
-        logger.info("Successfully connected to database and initialized connection pool")
-    except Exception as e:
-        logger.warning(
-            f"Could not connect to database: {obfuscate_password(str(e))}",
-        )
-        logger.warning(
-            "The MCP server will start but database operations will fail until a valid connection is established.",
-        )
+        if not database_url:
+            raise ValueError(
+                "Error: No database URL provided. Please specify via 'DATABASE_URI' environment variable or command-line argument.",
+            )
+
+        # Initialize database connection pool
+        try:
+            await db_connection.pool_connect(database_url)
+            logger.info("Successfully connected to database and initialized connection pool")
+        except Exception as e:
+            logger.warning(
+                f"Could not connect to database: {obfuscate_password(str(e))}",
+            )
+            logger.warning(
+                "The MCP server will start but database operations will fail until a valid connection is established.",
+            )
 
     # Set up proper shutdown handling
     try:

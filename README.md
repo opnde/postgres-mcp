@@ -649,3 +649,56 @@ The instructions below are for developers who want to work on Postgres MCP Pro, 
    ```bash
    uv run postgres-mcp "postgres://user:password@localhost:5432/dbname"
    ```
+
+## Per-request database credentials (`PGMCP_AUTH_MODE=header`)
+
+By default this server reads one `DATABASE_URI` at startup and serves every request
+from one pooled connection. Over HTTP that means every client shares a single
+database role: the database cannot tell users apart, `session_user` in the audit log
+is the service rather than the person, per-role `statement_timeout` /
+`CONNECTION LIMIT` / settings never apply, and revoking one person means rotating one
+credential for everyone.
+
+In `header` mode the server instead takes **only the role name and password** from a
+request header and opens a real login as that person for the duration of one tool
+call. Host, port and database name stay fixed in the server's own configuration, so a
+client can never point this server at a different database.
+
+This is not the same as `SET ROLE`: that changes `current_user` but not
+`session_user`, and it does not load the target role's settings - so timeouts,
+read-only defaults, audit GUCs and connection limits would all silently not apply.
+
+```bash
+export PGMCP_AUTH_MODE=header
+export PGMCP_DB_HOST=db.internal
+export PGMCP_DB_PORT=5432
+export PGMCP_DB_NAME=platform
+export PGMCP_ALLOWED_ROLES='^analyst_[a-z][a-z0-9_]{1,40}$'   # required, fails closed
+export PGMCP_CREDENTIAL_HEADER=x-db-credential                # default
+export PGMCP_JWT_ISSUER=https://<team>.cloudflareaccess.com   # enables JWT verification
+export PGMCP_JWT_AUDIENCE=<application aud tag>
+postgres-mcp --access-mode=restricted --transport=streamable-http
+```
+
+The client then sends, per request:
+
+```
+x-db-credential: analyst_jane:<her database password>
+```
+
+Notes:
+
+- `DATABASE_URI` must be unset in this mode. A leftover shared DSN is refused at
+  startup rather than kept as a fallback.
+- `PGMCP_ALLOWED_ROLES` is required and defaults to matching nothing. Without it a
+  leaked superuser password would be accepted.
+- Only `execute_sql`, `list_objects` and `get_object_details` support this mode; the
+  other tools refuse, because a tool that cannot say who is asking has no place on a
+  shared endpoint.
+- Setting `PGMCP_JWT_ISSUER` (or `PGMCP_JWKS_URL`) makes a verified edge assertion
+  mandatory: signature against the issuer's JWKS, `aud`, expiry, and optionally
+  `common_name` via `PGMCP_JWT_COMMON_NAME`. Merely checking that a header exists is
+  worthless, since anything that reaches the origin can set headers.
+- stdio is rejected in this mode: there is no request to take credentials from.
+- There is no connection pool per user on purpose. A warm connection must never be
+  reachable by a later request that failed to prove the same identity.

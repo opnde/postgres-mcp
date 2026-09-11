@@ -12,6 +12,10 @@ dependencies = [
     "attrs>=25.4.0",
     "psycopg-pool>=3.3.0",
     "instructor>=1.14.4",
+    # Only used when PGMCP_AUTH_MODE=header verifies an edge assertion (identity.py).
+    # `crypto` pulls in `cryptography` for RS256/ES256 signature checking - without it
+    # a JWT could only be decoded, not verified, which is worth nothing.
+    "pyjwt[crypto]>=2.10.1",
 ]
 license = "mit"
 license-files = ["LICENSE"]
