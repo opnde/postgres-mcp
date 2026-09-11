@@ -128,6 +128,47 @@ async def sql_session(ctx: Context | None) -> AsyncIterator[Union[SqlDriver, Saf
         await conn.close()
 
 
+def apply_transport_security(bind_host: str) -> None:
+    """Recompute DNS rebinding protection once the real bind host is known.
+
+    FastMCP decides this in its constructor. postgres-mcp builds the server at
+    import time, where the host is still the default `127.0.0.1`, so protection is
+    switched on with `allowed_hosts=["127.0.0.1:*", "localhost:*", "[::1]:*"]`.
+    `main()` then overrides `settings.host` for the HTTP transports - but the
+    security settings computed earlier stay behind.
+
+    The result listens on every address and rejects every request whose Host
+    header is not localhost, with `Invalid Host header` and no hint as to why.
+    Anything reached through a reverse proxy or tunnel under its own name hits
+    this (measured 11.09.2026 behind a Cloudflare tunnel).
+
+    `PGMCP_ALLOWED_HOSTS` (comma separated, `host` or `host:*`) declares the names
+    this server is reachable under. Without it we fall back to what upstream would
+    have done for this host: protection for localhost, none otherwise.
+    """
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    declared = [h.strip() for h in os.environ.get("PGMCP_ALLOWED_HOSTS", "").split(",") if h.strip()]
+    if declared:
+        mcp.settings.transport_security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=declared,
+            # Origin stays unrestricted: browsers set it, machine clients do not,
+            # and this server is not meant to be called from a web page.
+            allowed_origins=["*"],
+        )
+        logger.info("DNS rebinding protection on, allowed hosts: %s", ", ".join(declared))
+    elif bind_host in ("127.0.0.1", "localhost", "::1"):
+        logger.info("DNS rebinding protection on (localhost only)")
+    else:
+        mcp.settings.transport_security = None
+        logger.warning(
+            "DNS rebinding protection off: bound to %s without PGMCP_ALLOWED_HOSTS. "
+            "Set it to the hostname clients use, e.g. 'mcp.example.com'.",
+            bind_host,
+        )
+
+
 def _request_headers(ctx: Context | None) -> dict[str, str]:
     """Lower-cased headers of the HTTP request behind this tool call.
 
@@ -775,10 +816,12 @@ async def main():
     elif args.transport == "sse":
         mcp.settings.host = args.sse_host
         mcp.settings.port = args.sse_port
+        apply_transport_security(args.sse_host)
         await mcp.run_sse_async()
     elif args.transport == "streamable-http":
         mcp.settings.host = args.streamable_http_host
         mcp.settings.port = args.streamable_http_port
+        apply_transport_security(args.streamable_http_host)
         await mcp.run_streamable_http_async()
 
 

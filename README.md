@@ -699,6 +699,12 @@ Notes:
   mandatory: signature against the issuer's JWKS, `aud`, expiry, and optionally
   `common_name` via `PGMCP_JWT_COMMON_NAME`. Merely checking that a header exists is
   worthless, since anything that reaches the origin can set headers.
+- **`PGMCP_ALLOWED_HOSTS`**: declare the hostname clients actually use, comma separated
+  (`mcp.example.com` or `mcp.example.com:*`). Without it, a server bound to a non-local
+  address turns DNS rebinding protection off, because FastMCP fixes `allowed_hosts` when
+  the server object is built - at that point the host is still the default `127.0.0.1`,
+  and a later `--streamable-http-host` does not update it. The symptom otherwise is
+  `Invalid Host header` on every request through a proxy or tunnel.
 - stdio is rejected in this mode: there is no request to take credentials from.
 - There is no connection pool per user on purpose. A warm connection must never be
   reachable by a later request that failed to prove the same identity.

@@ -256,3 +256,41 @@ def test_error_messages_never_contain_the_credential(verifying):
         assert "postgres" not in str(exc)
     else:  # pragma: no cover
         pytest.fail("a role outside the allowlist must be refused")
+
+
+# ------------------------------------------------------------ transport security
+
+
+@pytest.fixture
+def server_module(monkeypatch):
+    from postgres_mcp import server
+
+    monkeypatch.setattr(server.mcp, "settings", server.mcp.settings.model_copy(deep=True))
+    return server
+
+
+def test_declared_hosts_are_allowed(server_module, monkeypatch):
+    """The reason this exists: FastMCP fixes allowed_hosts at construction time,
+    when the host is still the default 127.0.0.1. Binding elsewhere later leaves
+    a server that listens everywhere and refuses every request by name."""
+    monkeypatch.setenv("PGMCP_ALLOWED_HOSTS", "mcp.example.com, mcp.example.com:*")
+    server_module.apply_transport_security("0.0.0.0")
+    sec = server_module.mcp.settings.transport_security
+    assert sec is not None
+    assert sec.enable_dns_rebinding_protection is True
+    assert "mcp.example.com" in sec.allowed_hosts
+
+
+def test_non_localhost_without_declaration_disables_protection(server_module, monkeypatch):
+    """Matches what upstream would have done for this bind host - and is loud
+    about it in the log rather than failing every request silently."""
+    monkeypatch.delenv("PGMCP_ALLOWED_HOSTS", raising=False)
+    server_module.apply_transport_security("0.0.0.0")
+    assert server_module.mcp.settings.transport_security is None
+
+
+def test_localhost_keeps_the_default_protection(server_module, monkeypatch):
+    monkeypatch.delenv("PGMCP_ALLOWED_HOSTS", raising=False)
+    before = server_module.mcp.settings.transport_security
+    server_module.apply_transport_security("127.0.0.1")
+    assert server_module.mcp.settings.transport_security is before
