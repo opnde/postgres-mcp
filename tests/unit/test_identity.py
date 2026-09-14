@@ -66,6 +66,23 @@ def test_connection_target_comes_from_the_server_not_the_client():
     assert got["password"] == "s3cret"
 
 
+def test_the_connection_names_its_channel():
+    """`application_name` must reach PostgreSQL, or the audit log cannot tell this
+    endpoint apart from the analyst kit.
+
+    The person's ROLE is identical on both paths - that is the point of the role
+    model. Without a channel name both appear as `app=[unknown]` and "who really
+    uses this endpoint" becomes an inference from the absence of `app=psql`.
+    """
+    got = conninfo_to_dict(conninfo_for({"x-db-credential": "analyst_oliver:s3cret"}, cfg()))
+    assert got["application_name"] == "langdock"
+
+    named = conninfo_to_dict(
+        conninfo_for({"x-db-credential": "analyst_oliver:s3cret"}, cfg(application_name="langdock-test"))
+    )
+    assert named["application_name"] == "langdock-test"
+
+
 def test_password_with_shell_and_dsn_metacharacters_survives_intact():
     """The reason credentials are passed as parameters instead of a built string.
 

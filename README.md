@@ -677,6 +677,7 @@ export PGMCP_ALLOWED_ROLES='^analyst_[a-z][a-z0-9_]{1,40}$'   # required, fails 
 export PGMCP_CREDENTIAL_HEADER=x-db-credential                # default
 export PGMCP_JWT_ISSUER=https://<team>.cloudflareaccess.com   # enables JWT verification
 export PGMCP_JWT_AUDIENCE=<application aud tag>
+export PGMCP_APPLICATION_NAME=langdock                        # default; names the channel
 postgres-mcp --access-mode=restricted --transport=streamable-http
 ```
 
@@ -685,6 +686,12 @@ The client then sends, per request:
 ```
 x-db-credential: analyst_jane:<her database password>
 ```
+
+`PGMCP_APPLICATION_NAME` reaches PostgreSQL as `application_name` and shows up in
+`pg_stat_activity` and in every log line (`app=…`). It is worth setting deliberately:
+the same person may reach the same role through this server and through psql, so
+without a channel name both appear as `app=[unknown]` and telling them apart becomes
+an inference rather than a record.
 
 Notes:
 

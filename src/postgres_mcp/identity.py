@@ -96,6 +96,16 @@ class IdentityConfig:
     # match. This pins the endpoint to one calling system.
     jwt_common_name: str | None = None
 
+    # Reported to PostgreSQL as `application_name`, so every row the server
+    # causes carries the channel it came through.
+    #
+    # Why this is not cosmetic: the person's role is the same whether they query
+    # through this server or through psql on their own machine. Without a name,
+    # both land in the audit log as `app=[unknown]` and the only way to tell them
+    # apart is the absence of `app=psql` - an inference, not a record. Operators
+    # answering "who actually uses this endpoint" should read it, not deduce it.
+    application_name: str = "langdock"
+
     @classmethod
     def from_env(cls) -> IdentityConfig:
         mode = os.environ.get("PGMCP_AUTH_MODE", "dsn").strip().lower()
@@ -140,6 +150,7 @@ class IdentityConfig:
             jwt_audience=os.environ.get("PGMCP_JWT_AUDIENCE"),
             jwt_header=os.environ.get("PGMCP_JWT_HEADER", "cf-access-jwt-assertion").strip().lower(),
             jwt_common_name=os.environ.get("PGMCP_JWT_COMMON_NAME") or None,
+            application_name=os.environ.get("PGMCP_APPLICATION_NAME", "langdock").strip() or "langdock",
         )
 
 
@@ -254,6 +265,7 @@ def conninfo_for(headers: dict[str, str], cfg: IdentityConfig) -> str:
         user=user,
         password=password,
         connect_timeout=cfg.connect_timeout,
+        application_name=cfg.application_name,
         **({"sslmode": cfg.sslmode} if cfg.sslmode else {}),
     )
 
