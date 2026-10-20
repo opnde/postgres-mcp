@@ -99,7 +99,7 @@ async def get_sql_driver() -> Union[SqlDriver, SafeSqlDriver]:
 
 
 @asynccontextmanager
-async def sql_session(ctx: Context | None) -> AsyncIterator[Union[SqlDriver, SafeSqlDriver]]:
+async def sql_session(ctx: Context | None) -> AsyncIterator[Union[SqlDriver, SafeSqlDriver]]:  # pyright: ignore[reportMissingTypeArgument]
     """Yield a driver for one tool call, then close whatever it opened.
 
     `dsn` mode hands out the shared pool, exactly as upstream does. `header` mode
@@ -169,13 +169,12 @@ def apply_transport_security(bind_host: str) -> None:
     else:
         mcp.settings.transport_security = None
         logger.warning(
-            "DNS rebinding protection off: bound to %s without PGMCP_ALLOWED_HOSTS. "
-            "Set it to the hostname clients use, e.g. 'mcp.example.com'.",
+            "DNS rebinding protection off: bound to %s without PGMCP_ALLOWED_HOSTS. Set it to the hostname clients use, e.g. 'mcp.example.com'.",
             bind_host,
         )
 
 
-def _request_headers(ctx: Context | None) -> dict[str, str]:
+def _request_headers(ctx: Context | None) -> dict[str, str]:  # pyright: ignore[reportMissingTypeArgument]
     """Lower-cased headers of the HTTP request behind this tool call.
 
     Only HTTP transports carry a request. Under stdio there is none, and there is
@@ -239,14 +238,13 @@ async def list_schemas() -> ResponseType:
     ),
 )
 async def list_objects(
-    ctx: Context,
+    ctx: Context,  # pyright: ignore[reportMissingTypeArgument]
     schema_name: str = Field(description="Schema name"),
     object_type: str = Field(description="Object type: 'table', 'view', 'sequence', or 'extension'", default="table"),
 ) -> ResponseType:
     """List objects of a given type in a schema."""
     try:
         async with sql_session(ctx) as sql_driver:
-
             if object_type in ("table", "view"):
                 table_type = "BASE TABLE" if object_type == "table" else "VIEW"
                 rows = await SafeSqlDriver.execute_param_query(
@@ -321,7 +319,7 @@ async def list_objects(
     ),
 )
 async def get_object_details(
-    ctx: Context,
+    ctx: Context,  # pyright: ignore[reportMissingTypeArgument]
     schema_name: str = Field(description="Schema name"),
     object_name: str = Field(description="Object name"),
     object_type: str = Field(description="Object type: 'table', 'view', 'sequence', or 'extension'", default="table"),
@@ -329,7 +327,6 @@ async def get_object_details(
     """Get detailed information about a database object."""
     try:
         async with sql_session(ctx) as sql_driver:
-
             if object_type in ("table", "view"):
                 # Get columns
                 col_rows = await SafeSqlDriver.execute_param_query(
@@ -540,7 +537,7 @@ If there is no hypothetical index, you can pass an empty list.""",
 
 # Query function declaration without the decorator - we'll add it dynamically based on access mode
 async def execute_sql(
-    ctx: Context,
+    ctx: Context,  # pyright: ignore[reportMissingTypeArgument]
     sql: str = Field(description="SQL to run", default="all"),
 ) -> ResponseType:
     """Executes a SQL query against the database."""
@@ -785,8 +782,7 @@ async def main():
     if identity_config.enabled:
         if args.transport == "stdio":
             raise ValueError(
-                "PGMCP_AUTH_MODE=header needs an HTTP transport (--transport sse or streamable-http); "
-                "stdio has no request to take credentials from.",
+                "PGMCP_AUTH_MODE=header needs an HTTP transport (--transport sse or streamable-http); stdio has no request to take credentials from.",
             )
         if os.environ.get("DATABASE_URI") or args.database_url:
             # A leftover DSN here would be a loaded gun: one misrouted code path and

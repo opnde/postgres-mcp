@@ -77,9 +77,7 @@ def test_the_connection_names_its_channel():
     got = conninfo_to_dict(conninfo_for({"x-db-credential": "analyst_oliver:s3cret"}, cfg()))
     assert got["application_name"] == "langdock"
 
-    named = conninfo_to_dict(
-        conninfo_for({"x-db-credential": "analyst_oliver:s3cret"}, cfg(application_name="langdock-test"))
-    )
+    named = conninfo_to_dict(conninfo_for({"x-db-credential": "analyst_oliver:s3cret"}, cfg(application_name="langdock-test")))
     assert named["application_name"] == "langdock-test"
 
 
@@ -100,7 +98,7 @@ def test_password_cannot_smuggle_a_different_host():
     """A password that looks like DSN keywords must stay a password."""
     got = conninfo_to_dict(conninfo_for({"x-db-credential": "analyst_oliver:x' host=evil.example port=5432 '"}, cfg()))
     assert got["host"] == "db.internal"
-    assert "evil.example" not in got.get("host", "")
+    assert "evil.example" not in str(got.get("host", ""))
 
 
 def test_roles_outside_the_allowlist_are_refused():
@@ -217,7 +215,7 @@ def jwt_cfg(**kw) -> IdentityConfig:
     )
 
 
-def headers(token: str) -> dict:
+def headers(token: str) -> dict[str, str]:
     return {"cf-access-jwt-assertion": token, "x-db-credential": "analyst_oliver:pw"}
 
 
