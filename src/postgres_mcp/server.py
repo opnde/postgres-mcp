@@ -35,6 +35,10 @@ from .identity import role_of
 from .index.index_opt_base import MAX_NUM_INDEX_TUNING_QUERIES
 from .index.llm_opt import LLMOptimizerTool
 from .index.presentation import TextPresentation
+from .row_cap import RowCapConfig
+from .row_cap import format_rows
+from .row_cap import truncate
+from .row_cap import wrap_query
 from .sql import DbConnPool
 from .sql import SafeSqlDriver
 from .sql import SqlDriver
@@ -67,6 +71,8 @@ current_access_mode = AccessMode.UNRESTRICTED
 shutdown_in_progress = False
 # In `dsn` mode (upstream behaviour) this stays disabled and nothing below changes.
 identity_config = IdentityConfig()
+# Replaced from the environment in main(); the default (500 rows) also covers tests.
+row_cap_config = RowCapConfig()
 
 
 def _wrap_driver(base_driver: SqlDriver) -> Union[SqlDriver, SafeSqlDriver]:
@@ -540,10 +546,22 @@ async def execute_sql(
     """Executes a SQL query against the database."""
     try:
         async with sql_session(ctx) as sql_driver:
-            rows = await sql_driver.execute_query(sql)  # type: ignore
+            # The role only decides the exemption; by now the login as that role
+            # has succeeded, so it is proven, not just claimed.
+            role = role_of(_request_headers(ctx), identity_config) if identity_config.enabled else None
+            limit = row_cap_config.limit_for(role)
+            query = sql
+            if limit is not None:
+                query = wrap_query(sql, limit) or sql
+            rows = await sql_driver.execute_query(query)  # type: ignore
             if rows is None:
                 return format_text_response("No results")
-            return format_text_response(list([r.cells for r in rows]))
+            truncated = False
+            if limit is not None:
+                rows, truncated = truncate(rows, limit)
+                if truncated:
+                    logger.info("execute_sql result truncated to %d rows for role %s", limit, role)
+            return format_text_response(format_rows([r.cells for r in rows], limit, truncated))
     except Exception as e:
         logger.error(f"Error executing query: {e}")
         return format_error_response(str(e))
@@ -752,6 +770,17 @@ async def main():
     # so the database sees the actual person (see identity.py).
     global identity_config
     identity_config = IdentityConfig.from_env()
+
+    global row_cap_config
+    row_cap_config = RowCapConfig.from_env()
+    if row_cap_config.max_rows:
+        logger.info(
+            "execute_sql row cap: %d rows per call, exempt roles: %s",
+            row_cap_config.max_rows,
+            row_cap_config.exempt_roles.pattern if row_cap_config.exempt_roles else "none",
+        )
+    else:
+        logger.info("execute_sql row cap: off (PGMCP_MAX_ROWS=0)")
 
     if identity_config.enabled:
         if args.transport == "stdio":
