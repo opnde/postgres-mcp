@@ -35,6 +35,10 @@ from .identity import role_of
 from .index.index_opt_base import MAX_NUM_INDEX_TUNING_QUERIES
 from .index.llm_opt import LLMOptimizerTool
 from .index.presentation import TextPresentation
+from .row_cap import RowCapConfig
+from .row_cap import format_rows
+from .row_cap import truncate
+from .row_cap import wrap_query
 from .sql import DbConnPool
 from .sql import SafeSqlDriver
 from .sql import SqlDriver
@@ -67,6 +71,8 @@ current_access_mode = AccessMode.UNRESTRICTED
 shutdown_in_progress = False
 # In `dsn` mode (upstream behaviour) this stays disabled and nothing below changes.
 identity_config = IdentityConfig()
+# Replaced from the environment in main(); the default (500 rows) also covers tests.
+row_cap_config = RowCapConfig()
 
 
 def _wrap_driver(base_driver: SqlDriver) -> Union[SqlDriver, SafeSqlDriver]:
@@ -93,7 +99,7 @@ async def get_sql_driver() -> Union[SqlDriver, SafeSqlDriver]:
 
 
 @asynccontextmanager
-async def sql_session(ctx: Context | None) -> AsyncIterator[Union[SqlDriver, SafeSqlDriver]]:
+async def sql_session(ctx: Context | None) -> AsyncIterator[Union[SqlDriver, SafeSqlDriver]]:  # pyright: ignore[reportMissingTypeArgument]
     """Yield a driver for one tool call, then close whatever it opened.
 
     `dsn` mode hands out the shared pool, exactly as upstream does. `header` mode
@@ -163,13 +169,12 @@ def apply_transport_security(bind_host: str) -> None:
     else:
         mcp.settings.transport_security = None
         logger.warning(
-            "DNS rebinding protection off: bound to %s without PGMCP_ALLOWED_HOSTS. "
-            "Set it to the hostname clients use, e.g. 'mcp.example.com'.",
+            "DNS rebinding protection off: bound to %s without PGMCP_ALLOWED_HOSTS. Set it to the hostname clients use, e.g. 'mcp.example.com'.",
             bind_host,
         )
 
 
-def _request_headers(ctx: Context | None) -> dict[str, str]:
+def _request_headers(ctx: Context | None) -> dict[str, str]:  # pyright: ignore[reportMissingTypeArgument]
     """Lower-cased headers of the HTTP request behind this tool call.
 
     Only HTTP transports carry a request. Under stdio there is none, and there is
@@ -233,14 +238,13 @@ async def list_schemas() -> ResponseType:
     ),
 )
 async def list_objects(
-    ctx: Context,
+    ctx: Context,  # pyright: ignore[reportMissingTypeArgument]
     schema_name: str = Field(description="Schema name"),
     object_type: str = Field(description="Object type: 'table', 'view', 'sequence', or 'extension'", default="table"),
 ) -> ResponseType:
     """List objects of a given type in a schema."""
     try:
         async with sql_session(ctx) as sql_driver:
-
             if object_type in ("table", "view"):
                 table_type = "BASE TABLE" if object_type == "table" else "VIEW"
                 rows = await SafeSqlDriver.execute_param_query(
@@ -315,7 +319,7 @@ async def list_objects(
     ),
 )
 async def get_object_details(
-    ctx: Context,
+    ctx: Context,  # pyright: ignore[reportMissingTypeArgument]
     schema_name: str = Field(description="Schema name"),
     object_name: str = Field(description="Object name"),
     object_type: str = Field(description="Object type: 'table', 'view', 'sequence', or 'extension'", default="table"),
@@ -323,7 +327,6 @@ async def get_object_details(
     """Get detailed information about a database object."""
     try:
         async with sql_session(ctx) as sql_driver:
-
             if object_type in ("table", "view"):
                 # Get columns
                 col_rows = await SafeSqlDriver.execute_param_query(
@@ -534,16 +537,28 @@ If there is no hypothetical index, you can pass an empty list.""",
 
 # Query function declaration without the decorator - we'll add it dynamically based on access mode
 async def execute_sql(
-    ctx: Context,
+    ctx: Context,  # pyright: ignore[reportMissingTypeArgument]
     sql: str = Field(description="SQL to run", default="all"),
 ) -> ResponseType:
     """Executes a SQL query against the database."""
     try:
         async with sql_session(ctx) as sql_driver:
-            rows = await sql_driver.execute_query(sql)  # type: ignore
+            # The role only decides the exemption; by now the login as that role
+            # has succeeded, so it is proven, not just claimed.
+            role = role_of(_request_headers(ctx), identity_config) if identity_config.enabled else None
+            limit = row_cap_config.limit_for(role)
+            query = sql
+            if limit is not None:
+                query = wrap_query(sql, limit) or sql
+            rows = await sql_driver.execute_query(query)  # type: ignore
             if rows is None:
                 return format_text_response("No results")
-            return format_text_response(list([r.cells for r in rows]))
+            truncated = False
+            if limit is not None:
+                rows, truncated = truncate(rows, limit)
+                if truncated:
+                    logger.info("execute_sql result truncated to %d rows for role %s", limit, role)
+            return format_text_response(format_rows([r.cells for r in rows], limit, truncated))
     except Exception as e:
         logger.error(f"Error executing query: {e}")
         return format_error_response(str(e))
@@ -753,11 +768,21 @@ async def main():
     global identity_config
     identity_config = IdentityConfig.from_env()
 
+    global row_cap_config
+    row_cap_config = RowCapConfig.from_env()
+    if row_cap_config.max_rows:
+        logger.info(
+            "execute_sql row cap: %d rows per call, exempt roles: %s",
+            row_cap_config.max_rows,
+            row_cap_config.exempt_roles.pattern if row_cap_config.exempt_roles else "none",
+        )
+    else:
+        logger.info("execute_sql row cap: off (PGMCP_MAX_ROWS=0)")
+
     if identity_config.enabled:
         if args.transport == "stdio":
             raise ValueError(
-                "PGMCP_AUTH_MODE=header needs an HTTP transport (--transport sse or streamable-http); "
-                "stdio has no request to take credentials from.",
+                "PGMCP_AUTH_MODE=header needs an HTTP transport (--transport sse or streamable-http); stdio has no request to take credentials from.",
             )
         if os.environ.get("DATABASE_URI") or args.database_url:
             # A leftover DSN here would be a loaded gun: one misrouted code path and
