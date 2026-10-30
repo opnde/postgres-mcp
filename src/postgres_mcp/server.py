@@ -27,6 +27,7 @@ from .artifacts import ErrorResult
 from .artifacts import ExplainPlanArtifact
 from .database_health import DatabaseHealthTool
 from .database_health import HealthType
+from .error_hints import with_hint
 from .explain import ExplainPlanTool
 from .identity import AuthError
 from .identity import IdentityConfig
@@ -73,13 +74,31 @@ shutdown_in_progress = False
 identity_config = IdentityConfig()
 # Replaced from the environment in main(); the default (500 rows) also covers tests.
 row_cap_config = RowCapConfig()
+# Seconds before the restricted driver gives up on a query (PGMCP_QUERY_TIMEOUT).
+# Upstream hard-codes 30; set it just below the client's own tool timeout so the
+# model gets an answer with a hint instead of a dropped call.
+DEFAULT_QUERY_TIMEOUT = 30.0
+query_timeout = DEFAULT_QUERY_TIMEOUT
+
+
+def query_timeout_from_env() -> float:
+    raw = os.environ.get("PGMCP_QUERY_TIMEOUT", "").strip()
+    if not raw:
+        return DEFAULT_QUERY_TIMEOUT
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"PGMCP_QUERY_TIMEOUT must be a number of seconds, got {raw!r}") from exc
+    if value <= 0:
+        raise ValueError("PGMCP_QUERY_TIMEOUT must be > 0")
+    return value
 
 
 def _wrap_driver(base_driver: SqlDriver) -> Union[SqlDriver, SafeSqlDriver]:
     """Apply the access mode. The restricted wrapper is what makes this safe."""
     if current_access_mode == AccessMode.RESTRICTED:
         logger.debug("Using SafeSqlDriver with restrictions (RESTRICTED mode)")
-        return SafeSqlDriver(sql_driver=base_driver, timeout=30)  # 30 second timeout
+        return SafeSqlDriver(sql_driver=base_driver, timeout=query_timeout)
     logger.debug("Using unrestricted SqlDriver (UNRESTRICTED mode)")
     return base_driver
 
@@ -195,7 +214,7 @@ def format_text_response(text: Any) -> ResponseType:
 
 def format_error_response(error: str) -> ResponseType:
     """Format an error response."""
-    return format_text_response(f"Error: {error}")
+    return format_text_response(f"Error: {with_hint(error)}")
 
 
 @mcp.tool(
@@ -767,6 +786,10 @@ async def main():
     # so the database sees the actual person (see identity.py).
     global identity_config
     identity_config = IdentityConfig.from_env()
+
+    global query_timeout
+    query_timeout = query_timeout_from_env()
+    logger.info("query timeout (restricted mode): %.0f s", query_timeout)
 
     global row_cap_config
     row_cap_config = RowCapConfig.from_env()
