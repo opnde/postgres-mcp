@@ -38,6 +38,14 @@ _HINTS: tuple[tuple[re.Pattern[str], str], ...] = (
         "Temporary memory shortage on the database server. Retry once; if it fails again, make the query smaller.",
     ),
     (
+        # access-email mode (Claude connector): the login happens at the edge, so the
+        # Langdock advice below would send the user to a field that does not exist.
+        re.compile(r"edge assertion|no access through this endpoint|missing cf-access-jwt-assertion header", re.I),
+        "This is a connection setup problem, not a query problem: retrying will not help. Tell the user to "
+        "reconnect the connector (Customize > Connectors). If it still fails, their address is not enabled "
+        "for this connector - they should ask the operator.",
+    ),
+    (
         re.compile(r"credential header must be|missing [\w-]+ header|database login failed|may not connect through this endpoint", re.I),
         "This is a connection setup problem, not a query problem: retrying will not help. Tell the user to check the "
         "database credential in their Langdock connection, format '<role>:<password>' (e.g. analyst_firstname:...).",

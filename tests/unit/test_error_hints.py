@@ -71,3 +71,10 @@ async def test_restricted_driver_uses_configured_timeout(monkeypatch):
     driver = await server.get_sql_driver()
     assert isinstance(driver, SafeSqlDriver)
     assert driver.timeout == 55.0
+
+
+def test_edge_login_errors_do_not_point_to_langdock():
+    for msg in ("edge assertion invalid", "this identity has no access through this endpoint", "missing cf-access-jwt-assertion header"):
+        hint = hint_for(msg)
+        assert hint and "reconnect the connector" in hint and "Langdock" not in hint
+    assert "Langdock" in (hint_for("missing x-orca-db-auth header") or "")
