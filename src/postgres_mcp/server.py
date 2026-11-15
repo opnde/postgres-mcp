@@ -815,8 +815,9 @@ async def main():
                 "database URL - remove it so no shared connection can exist.",
             )
         logger.info(
-            "Per-request credentials enabled: header %s, database %s/%s, JWT verification %s",
-            identity_config.credential_header,
+            "Per-request credentials enabled: mode %s, header %s, database %s/%s, JWT verification %s",
+            identity_config.mode,
+            identity_config.credential_header if identity_config.mode == "header" else identity_config.jwt_header,
             identity_config.host,
             identity_config.dbname,
             "on" if identity_config.jwt_required else "OFF",
