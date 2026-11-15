@@ -34,14 +34,24 @@ Design rules, in order of importance:
    is worthless - anyone who can reach the origin can set headers - so the
    signature, `aud` and expiry are verified against the issuer's JWKS.
 5. **Nothing secret is ever logged.** Errors name the header, never its value.
+
+`access-email` mode is for clients that cannot send a per-user secret at all (Claude
+custom connectors authenticate with OAuth only). There the edge does the login: the
+verified edge JWT carries the person's e-mail, and the server maps it to a role
+from a fixed file and logs in with that role's password from a second file. The
+mapping is an explicit list - an address that is not in it gets nothing, however
+valid its token. The same real login applies, so the role's own settings still
+hold.
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
 from dataclasses import dataclass
+from dataclasses import field
 from typing import Any
 
 from psycopg.conninfo import make_conninfo
@@ -77,6 +87,13 @@ class IdentityConfig:
     """Server-side half of the connection: everything the client may NOT choose."""
 
     enabled: bool = False
+    # `header`: role and password come from a request header.
+    # `access-email`: the person comes from the verified edge JWT, role and
+    # password from the two files below.
+    mode: str = "header"
+    # access-email only: lower-case e-mail -> role, and role -> password.
+    identities: dict[str, str] = field(default_factory=dict)
+    passwords: dict[str, str] = field(default_factory=dict)
     credential_header: str = DEFAULT_CREDENTIAL_HEADER
     host: str | None = None
     port: int = 5432
@@ -109,20 +126,20 @@ class IdentityConfig:
     @classmethod
     def from_env(cls) -> IdentityConfig:
         mode = os.environ.get("PGMCP_AUTH_MODE", "dsn").strip().lower()
-        if mode not in ("dsn", "header"):
-            raise ValueError(f"PGMCP_AUTH_MODE must be 'dsn' or 'header', got {mode!r}")
+        if mode not in ("dsn", "header", "access-email"):
+            raise ValueError(f"PGMCP_AUTH_MODE must be 'dsn', 'header' or 'access-email', got {mode!r}")
         if mode == "dsn":
             return cls()
 
         host = os.environ.get("PGMCP_DB_HOST")
         dbname = os.environ.get("PGMCP_DB_NAME")
         if not host or not dbname:
-            raise ValueError("PGMCP_AUTH_MODE=header requires PGMCP_DB_HOST and PGMCP_DB_NAME")
+            raise ValueError(f"PGMCP_AUTH_MODE={mode} requires PGMCP_DB_HOST and PGMCP_DB_NAME")
 
         pattern_src = os.environ.get("PGMCP_ALLOWED_ROLES")
         if not pattern_src:
             raise ValueError(
-                "PGMCP_AUTH_MODE=header requires PGMCP_ALLOWED_ROLES, a regular expression "
+                f"PGMCP_AUTH_MODE={mode} requires PGMCP_ALLOWED_ROLES, a regular expression "
                 "matching the role names that may log in (e.g. '^analyst_[a-z0-9_]+$'). "
                 "Without it any leaked password, including a superuser's, would be accepted."
             )
@@ -135,14 +152,32 @@ class IdentityConfig:
         if jwt_required and not jwks_url:
             raise ValueError("PGMCP_JWT_REQUIRED is set but neither PGMCP_JWT_ISSUER nor PGMCP_JWKS_URL is configured")
 
+        role_pattern = re.compile(pattern_src)
+        identities: dict[str, str] = {}
+        passwords: dict[str, str] = {}
+        if mode == "access-email":
+            # The JWT is the only proof of who is asking, so every part of its
+            # check is mandatory here - not "on if configured".
+            audience = os.environ.get("PGMCP_JWT_AUDIENCE")
+            if not issuer or not audience or not jwt_required:
+                raise ValueError(
+                    "PGMCP_AUTH_MODE=access-email requires PGMCP_JWT_ISSUER and PGMCP_JWT_AUDIENCE, and JWT verification must stay on",
+                )
+            identities = load_identities(_required_env("PGMCP_IDENTITY_FILE"))
+            passwords = load_passwords(_required_env("PGMCP_PASSWORD_FILE"))
+            check_mapping(identities, passwords, role_pattern)
+
         return cls(
             enabled=True,
+            mode=mode,
+            identities=identities,
+            passwords=passwords,
             credential_header=os.environ.get("PGMCP_CREDENTIAL_HEADER", DEFAULT_CREDENTIAL_HEADER).strip().lower(),
             host=host,
             port=int(os.environ.get("PGMCP_DB_PORT", "5432")),
             dbname=dbname,
             sslmode=os.environ.get("PGMCP_DB_SSLMODE") or None,
-            role_pattern=re.compile(pattern_src),
+            role_pattern=role_pattern,
             connect_timeout=int(os.environ.get("PGMCP_CONNECT_TIMEOUT", "10")),
             jwt_required=jwt_required,
             jwks_url=jwks_url,
@@ -152,6 +187,61 @@ class IdentityConfig:
             jwt_common_name=os.environ.get("PGMCP_JWT_COMMON_NAME") or None,
             application_name=os.environ.get("PGMCP_APPLICATION_NAME", "langdock").strip() or "langdock",
         )
+
+
+def _required_env(name: str) -> str:
+    value = os.environ.get(name)
+    if not value:
+        raise ValueError(f"PGMCP_AUTH_MODE=access-email requires {name}")
+    return value
+
+
+def _lines(path: str) -> list[str]:
+    with open(path, encoding="utf-8") as fh:
+        return [ln.strip() for ln in fh if ln.strip() and not ln.lstrip().startswith("#")]
+
+
+def load_identities(path: str) -> dict[str, str]:
+    """`<e-mail> <role>` per line. One person may have several addresses."""
+    out: dict[str, str] = {}
+    for n, line in enumerate(_lines(path), 1):
+        parts = line.split()
+        if len(parts) != 2 or "@" not in parts[0]:
+            raise ValueError(f"{path}, line {n}: expected '<e-mail> <role>'")
+        email = parts[0].lower()
+        if email in out and out[email] != parts[1]:
+            raise ValueError(f"{path}, line {n}: address mapped to two roles")
+        out[email] = parts[1]
+    return out
+
+
+def load_passwords(path: str) -> dict[str, str]:
+    """`<role>:<password>` per line - the same shape as the credential header."""
+    out: dict[str, str] = {}
+    for n, line in enumerate(_lines(path), 1):
+        try:
+            role, password = split_credential(line)
+        except AuthError:
+            # Never echo the line: it holds a password.
+            raise ValueError(f"{path}, line {n}: expected '<role>:<password>'") from None
+        out[role] = password
+    return out
+
+
+def check_mapping(identities: dict[str, str], passwords: dict[str, str], role_pattern: re.Pattern[str]) -> None:
+    """Fail at start-up, not on the first request of the person it concerns."""
+    if not identities:
+        raise ValueError("PGMCP_IDENTITY_FILE maps no address - nobody could log in")
+    for role in sorted(set(identities.values())):
+        if not role_pattern.fullmatch(role):
+            raise ValueError(f"role {role} is outside PGMCP_ALLOWED_ROLES")
+        if role not in passwords:
+            raise ValueError(f"role {role} has no entry in PGMCP_PASSWORD_FILE")
+
+
+def _email_tag(email: str) -> str:
+    """Log a fingerprint, not the address: logs stay free of personal data."""
+    return hashlib.sha256(email.encode("utf-8")).hexdigest()[:8]
 
 
 def split_credential(raw: str) -> tuple[str, str]:
@@ -242,6 +332,9 @@ def conninfo_for(headers: dict[str, str], cfg: IdentityConfig) -> str:
     if not cfg.enabled:
         raise AuthError("per-request credentials are not enabled on this server")
 
+    if cfg.mode == "access-email":
+        return _conninfo_from_email(headers, cfg)
+
     if cfg.jwt_required:
         token = headers.get(cfg.jwt_header, "")
         if not token:
@@ -270,8 +363,60 @@ def conninfo_for(headers: dict[str, str], cfg: IdentityConfig) -> str:
     )
 
 
+def _conninfo_from_email(headers: dict[str, str], cfg: IdentityConfig) -> str:
+    token = headers.get(cfg.jwt_header, "")
+    if not token:
+        raise AuthError(f"missing {cfg.jwt_header} header")
+    claims = _verify_jwt(token, cfg)
+
+    # Service tokens carry `common_name` and no e-mail; only a person may pass.
+    email = str(claims.get("email") or "").strip().lower()
+    if not email:
+        logger.warning("edge assertion without e-mail refused")
+        raise AuthError("this identity has no access through this endpoint")
+
+    role = cfg.identities.get(email)
+    if role is None:
+        logger.warning("no role mapped for address %s", _email_tag(email))
+        raise AuthError("this identity has no access through this endpoint")
+    if not cfg.role_pattern.fullmatch(role) or role not in cfg.passwords:
+        # check_mapping() rules this out at start-up; stay closed if it ever drifts.
+        logger.error("mapped role %s is not usable", role)
+        raise AuthError("this identity has no access through this endpoint")
+
+    return make_conninfo(
+        host=cfg.host,
+        port=cfg.port,
+        dbname=cfg.dbname,
+        user=role,
+        password=cfg.passwords[role],
+        connect_timeout=cfg.connect_timeout,
+        application_name=cfg.application_name,
+        **({"sslmode": cfg.sslmode} if cfg.sslmode else {}),
+    )
+
+
+def _unverified_email(token: str) -> str | None:
+    try:
+        import jwt
+
+        claims = jwt.decode(token, options={"verify_signature": False})
+    except Exception:
+        return None
+    email = claims.get("email")
+    return str(email).strip().lower() if email else None
+
+
 def role_of(headers: dict[str, str], cfg: IdentityConfig) -> str | None:
-    """Role name for logging, without touching the password. Never raises."""
+    """Role name for logging, without touching the password. Never raises.
+
+    In `access-email` mode the token is read WITHOUT verification - callers use
+    this only for logging and for the row-cap exemption after `conninfo_for` has
+    verified the same token in the same request.
+    """
+    if cfg.mode == "access-email":
+        email = _unverified_email(headers.get(cfg.jwt_header, ""))
+        return cfg.identities.get(email) if email else None
     try:
         raw = headers.get(cfg.credential_header, "")
         return split_credential(raw)[0] if raw else None
