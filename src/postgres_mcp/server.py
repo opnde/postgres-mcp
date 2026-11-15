@@ -103,6 +103,47 @@ def _wrap_driver(base_driver: SqlDriver) -> Union[SqlDriver, SafeSqlDriver]:
     return base_driver
 
 
+# Tools that only work over the shared pool (they call get_sql_driver()). With
+# per-request credentials they can only ever answer "unavailable", so they are
+# removed from the tool list instead: a client that sees them tries them, and a
+# language model then reports the server as half broken.
+SHARED_POOL_TOOLS = (
+    "list_schemas",
+    "explain_query",
+    "analyze_workload_indexes",
+    "analyze_query_indexes",
+    "analyze_db_health",
+    "get_top_queries",
+)
+
+
+def hide_shared_pool_tools() -> list[str]:
+    removed = []
+    for name in SHARED_POOL_TOOLS:
+        try:
+            mcp.remove_tool(name)
+        except Exception:  # already absent - nothing to hide
+            continue
+        removed.append(name)
+    return removed
+
+
+def load_instructions(path: str | None) -> str | None:
+    """Server instructions from a file, sent to the client on `initialize`.
+
+    Clients without their own system prompt (Claude connectors) learn the rules
+    of the data this way - which views to use, which traps to avoid. Langdock has
+    its own agent prompt and needs none, so the file is optional.
+    """
+    if not path:
+        return None
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read().strip()
+    if not text:
+        raise ValueError(f"PGMCP_INSTRUCTIONS_FILE {path} is empty")
+    return text
+
+
 async def get_sql_driver() -> Union[SqlDriver, SafeSqlDriver]:
     """Driver over the shared, process-wide pool (`dsn` mode).
 
@@ -827,6 +868,12 @@ async def main():
                 "No edge assertion required. Anything that can reach this port may attempt a login; "
                 "put an authenticating proxy in front or set PGMCP_JWT_ISSUER.",
             )
+        logger.info("tools hidden (need the shared pool): %s", ", ".join(hide_shared_pool_tools()) or "none")
+
+    instructions = load_instructions(os.environ.get("PGMCP_INSTRUCTIONS_FILE"))
+    if instructions:
+        mcp._mcp_server.instructions = instructions  # pyright: ignore[reportPrivateUsage]
+        logger.info("server instructions loaded: %d characters", len(instructions))
     else:
         # Get database URL from environment variable or command line
         database_url = os.environ.get("DATABASE_URI", args.database_url)
