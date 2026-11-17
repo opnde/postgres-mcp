@@ -38,6 +38,14 @@ _HINTS: tuple[tuple[re.Pattern[str], str], ...] = (
         "Temporary memory shortage on the database server. Retry once; if it fails again, make the query smaller.",
     ),
     (
+        # Checked before the login rule: a full role is a capacity problem, and the
+        # login advice ("check your password") made the model give up (16.11.2026).
+        re.compile(r"database busy", re.I),
+        "Temporary: too many tool calls ran at the same time for this login. This is not a credential problem. "
+        "Wait a moment and retry the failed calls one after another instead of in parallel; keep using the "
+        "results of the calls that succeeded.",
+    ),
+    (
         # access-email mode (Claude connector): the login happens at the edge, so the
         # Langdock advice below would send the user to a field that does not exist.
         re.compile(r"edge assertion|no access through this endpoint|missing cf-access-jwt-assertion header", re.I),

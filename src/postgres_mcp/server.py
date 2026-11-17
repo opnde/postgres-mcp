@@ -25,6 +25,10 @@ from postgres_mcp.index.dta_calc import DatabaseTuningAdvisor
 
 from .artifacts import ErrorResult
 from .artifacts import ExplainPlanArtifact
+from .connection_gate import RETRY_DELAYS
+from .connection_gate import DatabaseBusyError
+from .connection_gate import RoleGate
+from .connection_gate import is_capacity_error
 from .database_health import DatabaseHealthTool
 from .database_health import HealthType
 from .error_hints import with_hint
@@ -72,6 +76,8 @@ current_access_mode = AccessMode.UNRESTRICTED
 shutdown_in_progress = False
 # In `dsn` mode (upstream behaviour) this stays disabled and nothing below changes.
 identity_config = IdentityConfig()
+# Caps concurrent per-request logins per role (connection_gate.py); replaced in main().
+role_gate = RoleGate()
 # Replaced from the environment in main(); the default (500 rows) also covers tests.
 row_cap_config = RowCapConfig()
 # Seconds before the restricted driver gives up on a query (PGMCP_QUERY_TIMEOUT).
@@ -174,24 +180,43 @@ async def sql_session(ctx: Context | None) -> AsyncIterator[Union[SqlDriver, Saf
     headers = _request_headers(ctx)
     conninfo = conninfo_for(headers, identity_config)
     role = role_of(headers, identity_config)
-    try:
-        conn = await psycopg.AsyncConnection.connect(conninfo)
-    except psycopg.OperationalError as exc:
-        # psycopg names host and port in its message ("connection to server at
-        # 10.x.x.x, port 5434 failed: FATAL: password authentication failed for
-        # user ..."). That message would travel to the MCP client and, from
-        # there, into a chat transcript - handing out internal topology and
-        # confirming which role names exist. Keep the detail in the server log,
-        # return a flat refusal.
-        logger.warning("login failed for role %s: %s", role, obfuscate_password(str(exc)))
-        raise AuthError("database login failed") from exc
-    try:
-        # Logged per call because this is the only record tying an MCP request to
-        # a database login; the password never reaches the log.
-        logger.info("sql session opened for role %s", role)
-        yield _wrap_driver(SqlDriver(conn=conn))
-    finally:
-        await conn.close()
+    # Clients fan out tool calls; without the gate a burst exceeds the role's
+    # CONNECTION LIMIT and the refusals look like failed logins (16.11.2026).
+    async with role_gate.hold(role):
+        conn = await _connect(conninfo, role)
+        try:
+            # Logged per call because this is the only record tying an MCP request to
+            # a database login; the password never reaches the log.
+            logger.info("sql session opened for role %s", role)
+            yield _wrap_driver(SqlDriver(conn=conn))
+        finally:
+            await conn.close()
+
+
+async def _connect(conninfo: str, role: str | None) -> psycopg.AsyncConnection:
+    """Log in as the role; retry only when the database is out of connection slots."""
+    for attempt, delay in enumerate((*RETRY_DELAYS, None)):
+        try:
+            return await psycopg.AsyncConnection.connect(conninfo)
+        except psycopg.OperationalError as exc:
+            detail = obfuscate_password(str(exc)) or ""
+            if is_capacity_error(detail):
+                # The role holds connections elsewhere too (psql, another client),
+                # so the gate alone cannot rule this out. Not a credential problem.
+                logger.warning("no connection slot for role %s (attempt %d): %s", role, attempt + 1, detail)
+                if delay is None:
+                    raise DatabaseBusyError("database busy: too many parallel connections for this login") from exc
+                await asyncio.sleep(delay)
+                continue
+            # psycopg names host and port in its message ("connection to server at
+            # 10.x.x.x, port 5434 failed: FATAL: password authentication failed for
+            # user ..."). That message would travel to the MCP client and, from
+            # there, into a chat transcript - handing out internal topology and
+            # confirming which role names exist. Keep the detail in the server log,
+            # return a flat refusal.
+            logger.warning("login failed for role %s: %s", role, detail)
+            raise AuthError("database login failed") from exc
+    raise AssertionError("unreachable")
 
 
 def apply_transport_security(bind_host: str) -> None:
@@ -827,6 +852,15 @@ async def main():
     # so the database sees the actual person (see identity.py).
     global identity_config
     identity_config = IdentityConfig.from_env()
+
+    global role_gate
+    role_gate = RoleGate.from_env()
+    if identity_config.enabled:
+        logger.info(
+            "per-role connection cap: %d, wait for a slot up to %.0f s",
+            role_gate.max_per_role,
+            role_gate.wait,
+        )
 
     global query_timeout
     query_timeout = query_timeout_from_env()
