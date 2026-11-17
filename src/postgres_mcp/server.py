@@ -908,7 +908,11 @@ async def main():
     if instructions:
         mcp._mcp_server.instructions = instructions  # pyright: ignore[reportPrivateUsage]
         logger.info("server instructions loaded: %d characters", len(instructions))
-    else:
+
+    # Shared pool only in `dsn` mode. This used to be the `else` of the
+    # identity block; #5 put the instructions in between and re-attached it to
+    # `if instructions:`, so header mode without PGMCP_INSTRUCTIONS_FILE died here.
+    if not identity_config.enabled:
         # Get database URL from environment variable or command line
         database_url = os.environ.get("DATABASE_URI", args.database_url)
 
