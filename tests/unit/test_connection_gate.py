@@ -95,7 +95,8 @@ async def test_without_the_gate_the_same_burst_is_refused(per_request):
     """Guards the test itself: with a cap above the limit, the fake database refuses."""
     db = FakeDb(limit=8)
     per_request(db, RoleGate(max_per_role=50, wait=5))
-    results = await asyncio.gather(*(one_call() for _ in range(15)), return_exceptions=True)
+    # Hold long enough that the zero-delay retries cannot outlast the first eight calls.
+    results = await asyncio.gather(*(one_call(hold=0.3) for _ in range(15)), return_exceptions=True)
     failures = [r for r in results if isinstance(r, Exception)]
     assert failures and all(isinstance(f, DatabaseBusyError) for f in failures)
 
